@@ -6,14 +6,22 @@ import os
 import requests
 import json
 import ipaddress
-from datetime import datetime
 import time
+import logging
+
+from requests.exceptions import ConnectionError
 
 config_file = "config.txt"
 
-SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
-DEFAULT_RETRIES = 3
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s - %(levelname)s - %(message)s')
 
+logger = logging.getLogger(__name__)
+
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+
+# The time between checks of ip changes (in seconds)
+DEFAULT_TIME_BETWEEN_CHECKS = 300
 
 PUBLIC_IP_SITES_LOADERS = {
     'https://api.ipify.org/?format=json': lambda resp: str(resp.json()['ip']),
@@ -27,36 +35,19 @@ class GandiDdnsError(Exception):
     pass
 
 def get_public_ip():
+    # Try every site
     for site, loader in PUBLIC_IP_SITES_LOADERS.items():
-        print(f"getting public IP from {site}")
+        logger.info(f"Getting public IP from {site}")
         resp = requests.get(site)
+        # Try next site
         if resp.status_code >= 400:
-            print(f"site {site} returned {resp.status_code} trying next site...")
+            logger.warning(f"Site {site} returned {resp.status_code} trying next site...")
             continue
+        # Parse IP
         public_ip = loader(resp)
         if not(ipaddress.IPv4Address(public_ip)):  # check if valid IPv4 address
             raise GandiDdnsError('Got invalid IP: ' + public_ip)
         return public_ip
-    else:
-        raise ValueError("unable to lookup public IP... check settings")
-
-def get_ip(retries):
-    # Get external IP with retries
-
-    # Start at 5 seconds, double on every retry.
-    retry_delay_time = 5
-    for attempt in range(retries):
-        try:
-            return get_public_ip()
-        except GandiDdnsError as e:
-            print('Getting external IP failed: %s' % e)
-            print('Waiting for %d seconds before trying again' % retry_delay_time)
-            time.sleep(retry_delay_time)
-            # Double retry time, cap at 60s.
-            retry_delay_time = min(60, 2 * retry_delay_time)
-        print('Exhausted retry attempts')
-        sys.exit(2)
-
 
 def read_config(config_path):
     # Read configuration file
@@ -74,62 +65,88 @@ def get_record(url, headers):
 
 
 def update_record(url, headers, payload):
+    logger.info("Updating record ...")
     # Add record
     r = requests.put(url, headers=headers, json=payload)
     if r.status_code != 201:
-        print(('Record update failed with status code: %d' % r.status_code))
-        print((r.text))
-        sys.exit(2)
-        print('Zone record updated.')
-
-    return r
+        logger.error(('Record update failed with status code: %d' % r.status_code))
+        logger.error((r.text))
+    else:
+        logger.info("Record succesfully updated.")
 
 
 def main():
+    logger.info("Starting gandi_ddns_updater ...")
+
+    logger.info("Loading config.txt file ...")
     path = config_file
     if not path.startswith('/'):
         path = os.path.join(SCRIPT_DIR, path)
 
     if (not os.path.exists(path)):
-        sys.exit("Could not find 'config.txt' file.")
+        logger.error(f"Could not find {path} file.")
+        sys.exit()
     config = read_config(path)
     if not config:
-        sys.exit("Please fill in the 'config.txt' file.")
+        logger.error(f"Invalid configuration file.")
+        sys.exit("")
 
-    for section in config.sections():
-        print('%s - section %s' % (str(datetime.now()), section))
+    # Retrieve config parameters
+    section = "local"
+    apikey = config.get(section, 'apikey')
+    gandi_api = config.get(section, 'gandi_api')
+    domain = config.get(section, 'domain')
+    a_name = config.get(section, 'a_name')
+    ttl = config.get(section, 'ttl')
+    time_between_checks = int(config.get(section, 'time_between_checks', fallback=DEFAULT_TIME_BETWEEN_CHECKS))
 
-        # Retrieve API key
-        apikey = config.get(section, 'apikey')
+    # Set headers
+    headers = {'Content-Type': 'application/json', 'Authorization': 'Apikey %s' % apikey}
 
-        # Set headers
-        headers = {'Content-Type': 'application/json', 'Authorization': 'Apikey %s' % apikey}
+    # Set URL
+    url = '%sdomains/%s/records/%s/A' % (gandi_api, domain, a_name)
 
-        # Set URL
-        url = '%sdomains/%s/records/%s/A' % (config.get(section, 'gandi_api'),
-                                             config.get(section, 'domain'), config.get(section, 'a_name'))
-        print(url)
-        # Discover External IP
-        retries = int(config.get(section, 'retries', fallback=DEFAULT_RETRIES))
-        external_ip = get_ip(retries)
-        print(('External IP is: %s' % external_ip))
+    previous_ip = None
 
-        # Prepare record
-        payload = {'rrset_ttl': config.get(section, 'ttl'), 'rrset_values': [external_ip]}
+    while(True):
+        # Get the current ip
+        try:
+            current_ip = get_public_ip()
+            logger.info(f"Current IP is: {current_ip}")
+        except (ConnectionError, GandiDdnsError) as e :
+            logger.warning(f"Could not check IP, check your network connectivity, trying again in {time_between_checks} seconds.")
+            time.sleep(time_between_checks)
+            continue
 
-        # Check current record
-        record = get_record(url, headers)
+        # If the current IP has changed
+        if current_ip != previous_ip:
+            logger.info(f"IP Address has changed from {previous_ip} to {current_ip}")
+            previous_ip = current_ip
 
-        if record.status_code == 200:
-            print(('Current record value is: %s' % json.loads(record.text)['rrset_values'][0]))
-            if(json.loads(record.text)['rrset_values'][0] == external_ip):
-                print('No change in IP address. Goodbye.')
-                continue
+            # Prepare record
+            payload = {'rrset_ttl': ttl, 'rrset_values': [current_ip]}
+
+            logger.debug(url)
+
+            # Check current record
+            record = get_record(url, headers)
+
+            if record.status_code == 200:
+                logger.debug(('Current record value is: %s' % json.loads(record.text)['rrset_values'][0]))
+                if(json.loads(record.text)['rrset_values'][0] == current_ip):
+                    logger.info(f"DNS value is already set to {current_ip}, no need to update it.")
+                else:
+                    logger.info("Current record is out of date, updating ...")
+                    update_record(url, headers, payload)
+            else:
+                logger.info('No existing record or record out of date. Adding...')
+                update_record(url, headers, payload)
+
         else:
-            print('No existing record. Adding...')
+            logger.info(f"IP Address is still {previous_ip}, no change needed.")
 
-        update_record(url, headers, payload)
-
+        logger.info(f"Next check in {time_between_checks} seconds.")
+        time.sleep(time_between_checks)
 
 if __name__ == "__main__":
     main()
