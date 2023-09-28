@@ -1,0 +1,12 @@
+[Unit]
+Description=Gandi DDNS Updater
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/bin/gandi_ddns_updater/gandi_ddns.py
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
