@@ -1,3 +1,5 @@
+#!/usr/bin/python3
+
 import configparser as configparser
 import sys
 import os
@@ -11,41 +13,41 @@ config_file = "config.txt"
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 DEFAULT_RETRIES = 3
-DEFAULT_IPIFY_API = "https://api.ipify.org"
+
+
+PUBLIC_IP_SITES_LOADERS = {
+    'https://api.ipify.org/?format=json': lambda resp: str(resp.json()['ip']),
+    'http://ip.42.pl/raw': lambda resp: str(resp.text),
+    'http://jsonip.com': lambda resp: str(resp.json()['ip']),
+    'http://httpbin.org/ip': lambda resp: str(resp.json()['origin']).split(',')[0].strip(),
+}
 
 
 class GandiDdnsError(Exception):
     pass
 
+def get_public_ip():
+    for site, loader in PUBLIC_IP_SITES_LOADERS.items():
+        print(f"getting public IP from {site}")
+        resp = requests.get(site)
+        if resp.status_code >= 400:
+            print(f"site {site} returned {resp.status_code} trying next site...")
+            continue
+        public_ip = loader(resp)
+        if not(ipaddress.IPv4Address(public_ip)):  # check if valid IPv4 address
+            raise GandiDdnsError('Got invalid IP: ' + public_ip)
+        return public_ip
+    else:
+        raise ValueError("unable to lookup public IP... check settings")
 
-def get_ip_inner(ipify_api):
-    # Get external IP
-    try:
-        # Could be any service that just gives us a simple raw ASCII IP address (not HTML etc)
-        r = requests.get(ipify_api, timeout=3)
-    except requests.exceptions.RequestException:
-        raise GandiDdnsError('Failed to retrieve external IP.')
-    if r.status_code != 200:
-        raise GandiDdnsError(
-            'Failed to retrieve external IP.'
-            ' Server responded with status_code: %d' % r.status_code)
-
-    ip = r.text.rstrip()  # strip \n and any trailing whitespace
-
-    if not(ipaddress.IPv4Address(ip)):  # check if valid IPv4 address
-        raise GandiDdnsError('Got invalid IP: ' + ip)
-
-    return ip
-
-
-def get_ip(ipify_api, retries):
+def get_ip(retries):
     # Get external IP with retries
 
     # Start at 5 seconds, double on every retry.
     retry_delay_time = 5
     for attempt in range(retries):
         try:
-            return get_ip_inner(ipify_api)
+            return get_public_ip()
         except GandiDdnsError as e:
             print('Getting external IP failed: %s' % e)
             print('Waiting for %d seconds before trying again' % retry_delay_time)
@@ -87,6 +89,9 @@ def main():
     path = config_file
     if not path.startswith('/'):
         path = os.path.join(SCRIPT_DIR, path)
+
+    if (not os.path.exists(path)):
+        sys.exit("Could not find 'config.txt' file.")
     config = read_config(path)
     if not config:
         sys.exit("Please fill in the 'config.txt' file.")
@@ -105,9 +110,8 @@ def main():
                                              config.get(section, 'domain'), config.get(section, 'a_name'))
         print(url)
         # Discover External IP
-        ipify_api = config.get(section, 'ipify_api', fallback=DEFAULT_IPIFY_API)
         retries = int(config.get(section, 'retries', fallback=DEFAULT_RETRIES))
-        external_ip = get_ip(ipify_api, retries)
+        external_ip = get_ip(retries)
         print(('External IP is: %s' % external_ip))
 
         # Prepare record
